@@ -25,4 +25,4 @@ Homepage = "https://github.com/d-cogswell/MistrasDTA"
 Issues = "https://github.com/d-cogswell/MistrasDTA/issues"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "coveralls"]
