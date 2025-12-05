@@ -1,3 +1,7 @@
+[![release](https://img.shields.io/github/v/release/d-cogswell/MistrasDTA)](https://github.com/d-cogswell/MistrasDTA/releases)
+[![NewareNDA regression tests](https://github.com/d-cogswell/MistrasDTA/actions/workflows/tests.yml/badge.svg)](https://github.com/d-cogswell/MistrasDTA/actions/workflows/tests.yml)
+[![Coverage Status](https://coveralls.io/repos/github/d-cogswell/MistrasDTA/badge.svg?branch=development)](https://coveralls.io/github/d-cogswell/MistrasDTA?branch=development)
+
 # MistrasDTA
 Python module to read acoustic emissions hit data and waveforms from Mistras DTA files. The structure of these binary files is detailed in Appendix II of the Mistras user manual.
 
