@@ -12,6 +12,22 @@ from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
+# --- Discard logging (rate-limited) ------------------------------------------
+
+_DISCARD_COUNTS: Dict[str, int] = {}
+
+
+def _log_discard(key: str, msg: str, *, every: int = 1000, first: int = 5) -> None:
+    """
+    Log discards at INFO without flooding:
+      - log the first `first` occurrences
+      - then log every `every` occurrences
+    """
+    n = _DISCARD_COUNTS.get(key, 0) + 1
+    _DISCARD_COUNTS[key] = n
+    if n <= first or (every > 0 and n % every == 0):
+        logger.info(f"[discard {key} #{n}] {msg}")
+
 
 # --- Feature metadata (kept identical to original behavior) -------------------
 
@@ -51,7 +67,7 @@ CHID_byte_len = {
     19: 2,
     20: 4,
     21: 4,
-    22: 0,
+    22: 0,  # variable-length; number of bytes comes from msg 109
     23: 2,
     24: 2,
     31: 2,
@@ -211,6 +227,16 @@ def _decode_hit_payload(p: PayloadReader, state: _State) -> HitEvent:
     features: Dict[str, Any] = {}
 
     for chid in state.chid_list:
+        if chid not in CHID_to_str:
+            # If we ever get here, we will likely desync; log loudly and fail naturally.
+            _log_discard(
+                "unknown_chid",
+                f"CHID list contains unknown ID {chid}; decode will likely fail without a spec",
+                every=1,
+                first=50,
+            )
+            raise KeyError(chid)
+
         name = CHID_to_str[chid]
         b = CHID_byte_len[chid]
 
@@ -224,8 +250,7 @@ def _decode_hit_payload(p: PayloadReader, state: _State) -> HitEvent:
             v = p.f32() * 9.31e-4
         elif name == "PARTIAL POWER":
             n = state.partial_power_segments
-            v = p.read_bytes(n)   # bytes length n (or b'' if n==0)
-            # v = tuple(p.u8() for _ in range(state.partial_power_segments))
+            v = p.read_bytes(n)  # bytes length n (or b'' if n==0)
         else:
             if b == 1:
                 v = p.u8()
@@ -240,8 +265,13 @@ def _decode_hit_payload(p: PayloadReader, state: _State) -> HitEvent:
         features[name] = v
 
     # Ignore any remaining (parametrics)
-    if p.remaining() > 0:
-        _ = p.read_bytes(p.remaining())
+    rem = p.remaining()
+    if rem > 0:
+        _log_discard(
+            "hit_parametrics",
+            f"msg_id=1 dropping {rem} trailing bytes after feature vector (hit parametrics not decoded)",
+        )
+        _ = p.read_bytes(rem)
 
     return HitEvent(rtot_s=rtot_s, cid=cid, features=features)
 
@@ -251,19 +281,32 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
     _ = p.u16()  # MVERN
 
     while p.remaining() > 0:
-        lsub = p.u16()  # includes this u16 in the length
-        # We already consumed 2 bytes for lsub itself; subpayload is (lsub-2) bytes.
+        lsub = p.u16()
+        sub_len = lsub
         subpayload = PayloadReader(p.read_bytes(lsub))
 
         subid = subpayload.u8()
 
+        handled = False
+
         if subid == 5:
+            handled = True
             # Event Data Set Definition: CHID list
             n = subpayload.u8()
             chids = subpayload.unpack(f"<{n}B")
             state.chid_list = tuple(int(x) for x in chids)
 
+            unknown = [c for c in state.chid_list if c not in CHID_to_str]
+            if unknown:
+                _log_discard(
+                    "unknown_chid_list",
+                    f"Event Data Set Definition contains unknown CHIDs: {unknown}",
+                    every=1,
+                    first=50,
+                )
+
         elif subid == 23:
+            handled = True
             # Set Gain
             cid = subpayload.u8()
             gain_db = subpayload.u8()
@@ -273,8 +316,8 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
             # Nested hardware record
             subid2 = subpayload.u8()
             if subid2 == 42:
+                handled = True
                 # Parse only the fields needed for waveform scaling/time axis.
-                # The rest is intentionally consumed/skipped to keep behavior stable.
                 _ = subpayload.read_bytes(2)  # MVERN, b2
                 _ = subpayload.read_bytes(1)  # ADT
                 _ = subpayload.read_bytes(2)  # SETS, b2
@@ -291,8 +334,24 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
 
                 state.hardware_rows.append([ch, 1000 * srate, tdly])
 
-        # Any leftover bytes in this subrecord are ignored.
-        # (subpayload is bounded; any unconsumed bytes remain but are harmless here.)
+        if not handled:
+            _log_discard(
+                "hw_subrecord",
+                f"msg_id=42 skipping unhandled subrecord subid={subid} len={sub_len} bytes",
+                every=200,
+                first=20,
+            )
+
+        # Log leftover bytes even for handled records (partial decode)
+        left = subpayload.remaining()
+        if left > 0:
+            _log_discard(
+                "hw_subrecord_tail",
+                f"msg_id=42 subid={subid} leaving {left} unconsumed bytes (fields not decoded)",
+                every=200,
+                first=20,
+            )
+            _ = subpayload.read_bytes(left)
 
     # Refresh hardware view
     state.hardware = None
@@ -314,7 +373,7 @@ def _decode_waveform_payload(p: PayloadReader, state: _State, skip_wfm: bool) ->
     cid = p.u8()
     _ = p.u8()  # ALB
 
-    # Remaining payload is samples
+    # Remaining payload is samples (note: spec may also allow AEF tail; we currently ignore it)
     sample_bytes = p.read_bytes(p.remaining())
     n = len(sample_bytes) // 2
     samples = struct.unpack(f"<{n}h", sample_bytes)
@@ -340,15 +399,14 @@ def _decode_waveform_payload(p: PayloadReader, state: _State, skip_wfm: bool) ->
 
 # --- Public API -----------------------------------------------------------
 
-
 PathOrPaths = Union[Path, Sequence[Path]]
 
 
 def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = True) -> Iterable[BaseModel]:
     """
     Stream parsed events from one or more .DTA files.
-    - If 'file' is a string, it is treated as a single path.
-    - If 'file' is a sequence of strings, paths are processed in that order.
+    - If 'files' is a path-like, it is treated as a single path.
+    - If 'files' is a sequence, paths are processed in that order.
     validate=True keeps pydantic validation on; set False for maximum throughput.
     """
     files = [files] if isinstance(files, (str, Path)) else list(files)
@@ -375,7 +433,6 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
                 payload = sr.read_exact(payload_len)
 
                 # IDs 40–49 have an extra byte (ignored) inside payload:
-                # in the legacy/tested behavior, we treat it as part of the message framing.
                 if 40 <= msg_id <= 49:
                     p0 = PayloadReader(payload)
                     _ = p0.u8()  # ext id
@@ -389,19 +446,27 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
 
                 elif msg_id == 7:
                     # User comment (ignored in current outputs)
-                    _ = p.read_bytes(p.remaining())
+                    rem = p.remaining()
+                    if rem:
+                        _log_discard("msg7_comment", f"msg_id=7 dropping {rem} bytes (user comment not decoded)", every=500, first=20)
+                        _ = p.read_bytes(rem)
 
                 elif msg_id == 8:
-                    # Continued file marker (legacy passing behavior): read first 8 bytes, ignore the rest.
-                    _ = p.read_bytes(min(8, p.remaining()))
-                    if p.remaining() > 0:
-                        _ = p.read_bytes(p.remaining())
+                    # Continued file marker: we currently ignore the embedded setup record if present.
+                    rem = p.remaining()
+                    _ = p.read_bytes(min(8, rem))
+                    rem2 = p.remaining()
+                    if rem2 > 0:
+                        _log_discard("msg8_tail", f"msg_id=8 dropping {rem2} bytes after DOS time/date (embedded setup not decoded)", every=50, first=50)
+                        _ = p.read_bytes(rem2)
 
                 elif msg_id == 41:
                     # ASCII Product Definition: PVERN(u16) then ignore remainder
                     _ = p.u16()
-                    if p.remaining() > 0:
-                        _ = p.read_bytes(p.remaining())
+                    rem = p.remaining()
+                    if rem:
+                        _log_discard("msg41_ascii", f"msg_id=41 dropping {rem} bytes (ASCII product definition not decoded)", every=50, first=50)
+                        _ = p.read_bytes(rem)
 
                 elif msg_id == 42:
                     _decode_hw_setup_payload(p, state)
@@ -412,27 +477,40 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
 
                 elif msg_id == 109:
                     # Partial Power setup: segment_type(u8) then num_segments(u16)
-                    _ = p.u8()  # segment_type (always 0)
+                    _ = p.u8()  # segment_type
                     state.partial_power_segments = p.u16()
-                    # Ignore remainder (per-segment metadata not needed for hit decoding)
-                    if p.remaining() > 0:
-                        _ = p.read_bytes(p.remaining())
+                    rem = p.remaining()
+                    if rem:
+                        _log_discard("msg109_tail", f"msg_id=109 dropping {rem} bytes (per-segment metadata not decoded)", every=50, first=50)
+                        _ = p.read_bytes(rem)
 
                 elif msg_id in (128, 129, 130):
                     # Control events: RTOT(6) (ignore rest)
                     _ = p.rtot_seconds()
-                    if p.remaining() > 0:
-                        _ = p.read_bytes(p.remaining())
+                    rem = p.remaining()
+                    if rem:
+                        _log_discard("control_tail", f"msg_id={msg_id} dropping {rem} bytes after RTOT (extra payload not decoded)", every=200, first=20)
+                        _ = p.read_bytes(rem)
 
                 elif msg_id == 173:
+                    # Note: we treat remaining payload as samples; spec may allow trailing AEF copy.
+                    # If present, we'd be mis-decoding. Log if sample_bytes length is odd.
+                    if p.remaining() % 2 != 0:
+                        _log_discard("wfm_odd", f"msg_id=173 payload remaining {p.remaining()} is odd; may indicate trailing non-sample data", every=20, first=20)
                     ev = _decode_waveform_payload(p, state, skip_wfm=skip_wfm)
                     if ev is not None:
                         yield ev if validate else ev.model_construct(**ev.model_dump())
 
                 else:
-                    # Unknown message: ignore payload
-                    logger.debug(f"Unknown message ID {msg_id}, skipping {p.remaining()} bytes")
-                    _ = p.read_bytes(p.remaining())
+                    # Unknown message: ignore payload (INFO, rate-limited)
+                    rem = p.remaining()
+                    _log_discard(
+                        "unknown_msg",
+                        f"unknown msg_id={msg_id} skipping payload={rem} bytes",
+                        every=500,
+                        first=50,
+                    )
+                    _ = p.read_bytes(rem)
 
 
 def read_bin(files: PathOrPaths, skip_wfm: bool = False):
