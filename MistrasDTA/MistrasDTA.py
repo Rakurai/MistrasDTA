@@ -77,6 +77,45 @@ CHID_byte_len = {
     31: 2,  # UNKNOWN: placeholder
 }
 
+# --- Known unimplemented message IDs -----------------------------------------
+# These MIDs appear in real files but have no available spec documentation.
+# They are silently skipped (no log spam) since we can't decode them anyway.
+
+KNOWN_UNIMPLEMENTED_MIDS = {
+    11,   # Unknown marker/flag (0 bytes payload)
+    116,  # Unknown extended data (variable payload, up to 7KB observed)
+}
+
+# --- Known unimplemented hardware setup subrecord IDs ------------------------
+# These SubIDs appear in MID 42 but have no available spec or are metadata-only.
+# They are silently skipped to reduce log noise.
+
+KNOWN_UNIMPLEMENTED_SUBIDS = {
+    19,   # Reserved (no spec)
+    20,   # Reserved for Pre-amp Gain (no detail)
+    28,   # Alarm Definition (have spec but not needed for data decode)
+    29,   # AE Filter Definition (have spec but not needed for data decode)
+    30,   # Delta-T Filter Definition (have spec but not needed for data decode)
+    33,   # Reserved (no spec)
+    100,  # Start of Test Setup (marker only)
+    101,  # End of Setup (marker only)
+    103,  # Unknown (no spec)
+    106,  # Group Definition (have spec but not needed for data decode)
+    110,  # Group Parametric Assignment (have spec but not needed for data decode)
+    115,  # Unknown (appears with 39 bytes, no spec)
+    124,  # End of Group Settings (marker only)
+    136,  # Unknown (no spec)
+    137,  # Unknown (no spec)
+    138,  # Unknown (no spec)
+    139,  # Unknown (appears with 6 bytes, no spec)
+    146,  # Unknown (no spec)
+    148,  # Unknown (appears with 4370 bytes, large block, no spec)
+    151,  # Unknown (appears with 135 bytes, no spec)
+    154,  # Unknown (appears with 41 bytes, no spec)
+    172,  # Digital Filter Setup (mentioned but no detail)
+    176,  # Unknown (no spec)
+}
+
 
 # --- Low-level formats (GUIDE.md §0.1, §1) -----------------------------------
 # All multi-byte integers are little-endian (LSB first) per GUIDE.md §0.1
@@ -172,6 +211,7 @@ class HitEvent(BaseModel):
     rtot_s: float
     cid: int
     features: Dict[str, Any]
+    parametrics: Dict[int, int] = {}  # PID -> value (from hit parametric channels)
 
 
 class WaveformEvent(BaseModel):
@@ -188,8 +228,8 @@ class TimeDrivenEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rtot_s: float
-    parametrics: Dict[int, int]          # PID -> value (u16 in current decode)
-    per_channel: Dict[int, bytes]        # CID -> raw feature-vector bytes
+    parametrics: Dict[int, int]              # PID -> value (u16 in current decode)
+    per_channel: Dict[int, Dict[str, Any]]   # CID -> decoded feature dict (named fields)
 
 
 class TestStartEvent(BaseModel):
@@ -210,12 +250,30 @@ class _State:
     partial_power_segments: int = 0
     demand_chid_list: Tuple[int, ...] = ()
     demand_pid_list: Tuple[int, ...] = ()
+    # Additional hardware config collected from MID 42 subrecords
+    threshold: Dict[int, int] = None       # CID -> threshold dB (SubID 22)
+    hdt: Dict[int, int] = None             # CID -> hit definition time µs (SubID 24)
+    hlt: Dict[int, int] = None             # CID -> hit lockout time µs (SubID 25)
+    pdt: Dict[int, int] = None             # CID -> peak definition time µs (SubID 26)
+    sampling_interval_ms: Optional[int] = None  # global sampling interval (SubID 27)
+    demand_rate_ms: Optional[int] = None   # demand sampling rate (SubID 102)
+    # ASCII metadata from MID 7 and MID 41
+    product_name: Optional[str] = None     # product name + version (MID 41)
+    user_comment: Optional[str] = None     # user comment / test label (MID 7)
 
     def __post_init__(self) -> None:
         if self.gain is None:
             self.gain = {}
         if self.hardware_rows is None:
             self.hardware_rows = []
+        if self.threshold is None:
+            self.threshold = {}
+        if self.hdt is None:
+            self.hdt = {}
+        if self.hlt is None:
+            self.hlt = {}
+        if self.pdt is None:
+            self.pdt = {}
 
 
 def _ensure_hardware_recarray(state: _State) -> None:
@@ -294,18 +352,20 @@ def _decode_hit_payload(p: PayloadReader, state: _State) -> HitEvent:
         features[name] = v
 
     # --- HIT_PARAMETRICS: remaining bytes (PID:u8 + VALUE:u16 per parametric) ---
-    # Per GUIDE.md §3.1 step 5: repeat until end of message
-    # Format: PID:uint8, VALUE:uint16_le [, V3:uint8 if include_cycle_counter_msb]
-    # Currently NOT decoded; just logged and discarded.
-    rem = p.remaining()
-    if rem > 0:
-        _log_discard(
-            "hit_parametrics",
-            f"msg_id=1 dropping {rem} trailing bytes (hit parametrics: PID+u16 pairs)",
-        )
-        _ = p.read_bytes(rem)  # HIT_PARAMETRICS: not decoded
+    # Per DTA_SPEC §4.1.4: repeat until end of message
+    # Format: PID:uint8, VALUE:uint16_le per parametric channel
+    # Note: Messages end with 2 undocumented bytes (observed: varies, possibly checksum)
+    parametrics: Dict[int, int] = {}
+    while p.remaining() >= 5:  # need PID(1) + VALUE(2) + trailing(2)
+        pid = p.u8()    # PID: parametric channel ID
+        val = p.u16()   # VALUE: parametric value
+        parametrics[pid] = val
+    
+    # Consume trailing 2 bytes (undocumented, possibly checksum or padding)
+    if p.remaining() >= 2:
+        _ = p.u16()
 
-    return HitEvent(rtot_s=rtot_s, cid=cid, features=features)
+    return HitEvent(rtot_s=rtot_s, cid=cid, features=features, parametrics=parametrics)
 
 
 def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
@@ -329,7 +389,8 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
     while p.remaining() > 0:
         lsub = p.u16()
         sub_len = lsub
-        subpayload = PayloadReader(p.read_bytes(lsub))
+        raw_sub = p.read_bytes(lsub)
+        subpayload = PayloadReader(raw_sub)
 
         subid = subpayload.u8()
         handled = False
@@ -341,7 +402,7 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
             n = subpayload.u8()                      # byte[0]: N_CHID
             chids = subpayload.unpack(f"<{n}B")     # bytes[1:1+n]: CHID values
             state.chid_list = tuple(int(x) for x in chids)
-            # Remaining byte (if any) is MAX_HIT_PID — not currently used
+            _ = subpayload.u8()                      # MAX_HIT_PID
 
             unknown = [c for c in state.chid_list if c not in CHID_to_str]
             if unknown:
@@ -366,41 +427,113 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
 
         elif subid == 23:
             # --- SUBID 23: Set Gain (GUIDE.md §3.12, SPEC.md ID 23) ---
-            # Layout: CID:uint8, GAIN:uint8
+            # Layout: CID:uint8, GAIN:uint8, FLAGS:uint8
             handled = True
             cid = subpayload.u8()       # byte[0]: CID (channel number)
             gain_db = subpayload.u8()   # byte[1]: gain in dB
+            _ = subpayload.u8()         # byte[2]: flags/mode (observed: 0x14)
             state.gain[cid] = gain_db
+
+        elif subid == 22:
+            # --- SUBID 22: Set Threshold (SPEC.md ID 22) ---
+            # Layout: CID:uint8, V:uint8 (threshold dB, MSB=1 float, =0 fix), FLAGS:uint8
+            handled = True
+            cid = subpayload.u8()
+            thr = subpayload.u8()
+            _ = subpayload.u8()         # byte[2]: flags/mode (observed: 0x06)
+            state.threshold[cid] = thr
+
+        elif subid == 24:
+            # --- SUBID 24: Set Hit Definition Time (SPEC.md ID 24) ---
+            # Layout: CID:uint8, V:uint16_le (steps of 2 µs)
+            handled = True
+            cid = subpayload.u8()
+            val = subpayload.u16()
+            state.hdt[cid] = val * 2  # convert to µs
+
+        elif subid == 25:
+            # --- SUBID 25: Set Hit Lockout Time (SPEC.md ID 25) ---
+            # Layout: CID:uint8, V:uint16_le (steps of 2 µs)
+            handled = True
+            cid = subpayload.u8()
+            val = subpayload.u16()
+            state.hlt[cid] = val * 2  # convert to µs
+
+        elif subid == 26:
+            # --- SUBID 26: Set Peak Definition Time (SPEC.md ID 26) ---
+            # Layout: CID:uint8, V:uint16_le (steps of 1 µs)
+            handled = True
+            cid = subpayload.u8()
+            val = subpayload.u16()
+            state.pdt[cid] = val  # already in µs
+
+        elif subid == 27:
+            # --- SUBID 27: Set Sampling Interval (SPEC.md ID 27) ---
+            # Layout: V:uint16_le (steps of 1 ms)
+            handled = True
+            val = subpayload.u16()
+            state.sampling_interval_ms = val
+
+        elif subid == 102:
+            # --- SUBID 102: Set Demand Sampling Rate (SPEC.md) ---
+            # Layout: V:uint16_le (ms), PAD:uint16_le
+            handled = True
+            val = subpayload.u16()
+            state.demand_rate_ms = val
+            _ = subpayload.u16()  # padding/reserved
+
+        elif subid == 109:
+            # --- SUBID 109: Partial Power Setup (embedded in MID 42) ---
+            # Layout: SEGMENT_TYPE:uint8, N_SEG:uint16_le, PAD:3 bytes,
+            #         then N_SEG frequency band definitions (8 bytes each)
+            handled = True
+            _ = subpayload.u8()   # SEGMENT_TYPE (always 0)
+            n_seg = subpayload.u16()
+            state.partial_power_segments = n_seg
+            _ = subpayload.read_bytes(3)           # 3 bytes padding
+            _ = subpayload.read_bytes(n_seg * 8)   # frequency band definitions
 
         elif subid == 173:
             # --- SUBID 173: TRA setup container (nested submessage) ---
             # Contains another SUBID2 byte; we handle subid2=42.
-            subid2 = subpayload.u8()  # byte[0]: SUBID2
-            if subid2 == 42:
-                # --- SUBID 173, SUBID2 42: TRA Hardware Setup (GUIDE.md §4.4) ---
-                # Layout per GUIDE.md §4.4 (MID 172,42 / 173,42):
-                #   MVERN:uint16_le, ADT:uint8, SETS:uint8, SETS_PAD:uint8, SLEN:uint16_le
-                #   Then SETS repetitions of channel setup struct.
-                # NOTE: SLEN here is "size of each setup struct in bytes", NOT sample count!
-                #       Waveform sample count N is embedded in MID 173 subid 1 message itself.
+            if sub_len < 2:
+                # Too short for subid2, skip silently
                 handled = True
-                _ = subpayload.read_bytes(2)  # bytes[1:3]: MVERN (uint16_le, e.g. 100 = v1.00)
-                _ = subpayload.read_bytes(1)  # byte[3]: ADT (A/D data type; 2=16-bit signed)
-                _ = subpayload.read_bytes(2)  # bytes[4:6]: SETS + SETS_PAD (uint8 each)
-                _ = subpayload.read_bytes(2)  # bytes[6:8]: SLEN (setup struct size, NOT sample count)
-                # Per-channel setup block:
-                ch = subpayload.u8()          # byte[8]: CHID (channel, 0=all channels)
-                _ = subpayload.read_bytes(2)  # bytes[9:11]: HLK (hit lockout, uint16_le)
-                _ = subpayload.read_bytes(2)  # bytes[11:13]: HITS (uint16_le)
-                srate = subpayload.u16()      # bytes[13:15]: SRATE (sample rate, uint16_le)
-                _ = subpayload.read_bytes(2)  # bytes[15:17]: TMODE (trigger mode, uint16_le)
-                _ = subpayload.read_bytes(2)  # bytes[17:19]: TSRC (trigger source, uint16_le)
-                tdly = subpayload.i16()       # bytes[19:21]: TDLY (trigger delay, int16_le, negative=pretrigger)
-                _ = subpayload.read_bytes(2)  # bytes[21:23]: MXIN (max input, uint16_le)
-                _ = subpayload.read_bytes(2)  # bytes[23:25]: THRD (threshold, uint16_le)
+            else:
+                subid2 = subpayload.u8()  # byte[0]: SUBID2
+                if subid2 == 42:
+                    # --- SUBID 173, SUBID2 42: TRA Hardware Setup (GUIDE.md §4.4) ---
+                    # Layout per GUIDE.md §4.4 (MID 172,42 / 173,42):
+                    #   MVERN:uint16_le, ADT:uint8, SETS:uint8, SETS_PAD:uint8, SLEN:uint16_le
+                    #   Then SETS repetitions of channel setup struct.
+                    # NOTE: SLEN here is "size of each setup struct in bytes", NOT sample count!
+                    #       Waveform sample count N is embedded in MID 173 subid 1 message itself.
+                    handled = True
+                    _ = subpayload.read_bytes(2)  # bytes[1:3]: MVERN (uint16_le, e.g. 100 = v1.00)
+                    _ = subpayload.read_bytes(1)  # byte[3]: ADT (A/D data type; 2=16-bit signed)
+                    _ = subpayload.read_bytes(2)  # bytes[4:6]: SETS + SETS_PAD (uint8 each)
+                    _ = subpayload.read_bytes(2)  # bytes[6:8]: SLEN (setup struct size, NOT sample count)
+                    # Per-channel setup block:
+                    ch = subpayload.u8()          # byte[8]: CHID (channel, 0=all channels)
+                    _ = subpayload.read_bytes(2)  # bytes[9:11]: HLK (hit lockout, uint16_le)
+                    _ = subpayload.read_bytes(2)  # bytes[11:13]: HITS (uint16_le)
+                    srate = subpayload.u16()      # bytes[13:15]: SRATE (sample rate, uint16_le)
+                    _ = subpayload.read_bytes(2)  # bytes[15:17]: TMODE (trigger mode, uint16_le)
+                    _ = subpayload.read_bytes(2)  # bytes[17:19]: TSRC (trigger source, uint16_le)
+                    tdly = subpayload.i16()       # bytes[19:21]: TDLY (trigger delay, int16_le, negative=pretrigger)
+                    _ = subpayload.read_bytes(2)  # bytes[21:23]: MXIN (max input, uint16_le)
+                    _ = subpayload.read_bytes(2)  # bytes[23:25]: THRD (threshold, uint16_le)
 
-                # Store: SRATE is in kHz, multiply by 1000 for Hz
-                state.hardware_rows.append([ch, 1000 * srate, tdly])
+                    # Store: SRATE is in kHz, multiply by 1000 for Hz
+                    state.hardware_rows.append([ch, 1000 * srate, tdly])
+                else:
+                    # Unknown subid2 variant (e.g., short 2-byte payload with subid2 != 42)
+                    # These appear to be flags/markers, silently skip
+                    handled = True
+
+        # --- Skip known-unimplemented SubIDs silently ---
+        if subid in KNOWN_UNIMPLEMENTED_SUBIDS:
+            handled = True  # mark as handled to suppress log
 
         if not handled:
             _log_discard(
@@ -412,12 +545,14 @@ def _decode_hw_setup_payload(p: PayloadReader, state: _State) -> None:
 
         left = subpayload.remaining()
         if left > 0:
-            _log_discard(
-                "hw_subrecord_tail",
-                f"msg_id=42 subid={subid} leaving {left} unconsumed bytes (fields not decoded)",
-                every=200,
-                first=20,
-            )
+            # Only log tail bytes for SubIDs we actively decode (not silently skipped ones)
+            if subid not in KNOWN_UNIMPLEMENTED_SUBIDS:
+                _log_discard(
+                    "hw_subrecord_tail",
+                    f"msg_id=42 subid={subid} leaving {left} unconsumed bytes (fields not decoded)",
+                    every=200,
+                    first=20,
+                )
             _ = subpayload.read_bytes(left)
 
     state.hardware = None
@@ -518,13 +653,14 @@ def _decode_time_driven_payload(p: PayloadReader, state: _State) -> Optional[Tim
             fv_len += int(CHID_byte_len.get(chid, 0))
 
     # --- CHANNEL_BLOCKS: repeat CID(u8) + FV(fv_len bytes) until end ---
-    per_channel: Dict[int, bytes] = {}
+    per_channel: Dict[int, Dict[str, Any]] = {}
 
     # Need at least CID(1) + FV(fv_len) bytes
     while p.remaining() >= 1 + fv_len and fv_len > 0:
         cid = p.u8()                 # CID: uint8 (channel ID)
         fv = p.read_bytes(fv_len)    # FV: feature vector bytes
-        per_channel[cid] = fv
+        # Decode FV into named fields using demand CHID list
+        per_channel[cid] = _decode_td_fv_bytes(fv, state.demand_chid_list, state)
 
     # Tail guard
     if p.remaining() > 0:
@@ -609,7 +745,7 @@ def _decode_waveform_payload(p: PayloadReader, state: _State, skip_wfm: bool) ->
 PathOrPaths = Union[Path, Sequence[Path]]
 
 
-def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = True) -> Iterable[BaseModel]:
+def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = True, _state: Optional[_State] = None) -> Iterable[BaseModel]:
     """
     Stream parsed events from one or more .DTA files.
     
@@ -625,6 +761,7 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
         files: Path or sequence of paths to .DTA files
         skip_wfm: If True, skip waveform sample conversion (faster)
         validate: If True, use Pydantic validation; False for max throughput
+        _state: Internal state object (for capturing config in read_bin)
     
     Yields:
         HitEvent, WaveformEvent, TimeDrivenEvent, or TestStartEvent
@@ -632,7 +769,7 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
     files = [files] if isinstance(files, (str, Path)) else list(files)
     files = [Path(f) for f in files]
 
-    state = _State()
+    state = _state if _state is not None else _State()
 
     for path in files:
         with path.open("rb") as fp:
@@ -676,13 +813,8 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
                     # Layout: TEXT:bytes[LEN-1] (ASCII, may contain NUL)
                     rem = p.remaining()
                     if rem:
-                        _log_discard(
-                            "msg7_comment",
-                            f"msg_id=7 dropping {rem} bytes (TEXT: ASCII user comment)",
-                            every=500,
-                            first=20,
-                        )
-                        _ = p.read_bytes(rem)  # TEXT: not decoded
+                        raw = p.read_bytes(rem)
+                        state.user_comment = raw.rstrip(b'\x00').decode('ascii', errors='replace')
 
                 # --- MID 8: Continued File Marker (GUIDE.md §3.8, SPEC.md ID 8) ---
                 elif msg_id == 8:
@@ -707,13 +839,8 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
                     _ = p.u16()  # PVERN: product version number
                     rem = p.remaining()
                     if rem:
-                        _log_discard(
-                            "msg41_ascii",
-                            f"msg_id=41 dropping {rem} bytes (ASCII: product name + version string)",
-                            every=50,
-                            first=50,
-                        )
-                        _ = p.read_bytes(rem)  # ASCII: not decoded
+                        raw = p.read_bytes(rem)
+                        state.product_name = raw.rstrip(b'\x00').decode('ascii', errors='replace')
 
                 # --- MID 42: Hardware Setup (GUIDE.md §3.18, SPEC.md ID 42) ---
                 elif msg_id == 42:
@@ -741,18 +868,11 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
 
                 # --- MID 128/129/130: Control Messages (GUIDE.md mentions Resume/Stop/Pause) ---
                 elif msg_id in (128, 129, 130):
-                    # Layout: RTOT:bytes[6] + optional extra
+                    # Layout: RTOT:bytes[6], STATUS:uint8 (undocumented, observed: 0x01)
                     # 128 = Resume/Start, 129 = Stop, 130 = Pause
                     _ = p.rtot_seconds()  # RTOT: 6 bytes (time of control event)
-                    rem = p.remaining()
-                    if rem:
-                        _log_discard(
-                            "control_tail",
-                            f"msg_id={msg_id} dropping {rem} bytes after RTOT",
-                            every=200,
-                            first=20,
-                        )
-                        _ = p.read_bytes(rem)  # extra payload: not decoded
+                    if p.remaining() >= 1:
+                        _ = p.u8()  # STATUS: undocumented flag (observed: 0x01)
 
                 # --- MID 173: AEDSP/TRA Extended Messages (GUIDE.md §4) ---
                 elif msg_id == 173:
@@ -764,12 +884,14 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
                 # --- Unknown MID: skip entire payload ---
                 else:
                     rem = p.remaining()
-                    _log_discard(
-                        "unknown_msg",
-                        f"unknown msg_id={msg_id} skipping payload={rem} bytes",
-                        every=500,
-                        first=50,
-                    )
+                    # Only log if this is a truly unknown MID (not in known-unimplemented set)
+                    if msg_id not in KNOWN_UNIMPLEMENTED_MIDS:
+                        _log_discard(
+                            "unknown_msg",
+                            f"unknown msg_id={msg_id} skipping payload={rem} bytes",
+                            every=500,
+                            first=50,
+                        )
                     _ = p.read_bytes(rem)  # unknown: not decoded
 
 
@@ -779,7 +901,22 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
     from one or more Mistras .DTA files.
 
     Returns:
-        rec, wfm, td
+        rec, wfm, td, config
+        
+    Where config is a dict containing hardware setup information:
+        - test_start_time: datetime of test start
+        - chid_list: tuple of CHID values for hit features
+        - demand_chid_list: tuple of CHID values for time-driven features
+        - demand_pid_list: tuple of PID values for time-driven parametrics
+        - gain: dict of CID -> gain_dB
+        - threshold: dict of CID -> threshold_dB
+        - hdt: dict of CID -> hit_definition_time_us
+        - hlt: dict of CID -> hit_lockout_time_us
+        - pdt: dict of CID -> peak_definition_time_us
+        - sampling_interval_ms: global sampling interval
+        - demand_rate_ms: demand sampling rate
+        - partial_power_segments: number of partial power segments
+        - waveform_hardware: recarray with CH, SRATE, TDLY
     """
     logger.info(f"Starting to read DTA file(s): {files}")
     logger.info(f"skip_wfm={skip_wfm}")
@@ -788,23 +925,32 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
     wfm_rows: List[List[Any]] = []
     td_rows: List[List[Any]] = []
 
-    state_test_start: Optional[datetime] = None
+    # Create shared state to capture hardware config
+    state = _State()
 
     hit_count = 0
     wfm_count = 0
     td_count = 0
 
-    # We will build a stable TD schema from the first TD event we see.
+    # We will build stable schemas from the first events we see.
     td_pid_order: Optional[Tuple[int, ...]] = None
     td_cid_order: Optional[Tuple[int, ...]] = None
+    td_fv_keys: Optional[Tuple[str, ...]] = None  # feature names within each CID's FV
+    hit_param_order: Optional[Tuple[int, ...]] = None  # parametric PIDs for hits
 
-    for ev in iter_bin(files, skip_wfm=skip_wfm, validate=True):
+    for ev in iter_bin(files, skip_wfm=skip_wfm, validate=True, _state=state):
         if isinstance(ev, TestStartEvent):
-            state_test_start = ev.test_start_time
+            state.test_start_time = ev.test_start_time
 
         elif isinstance(ev, HitEvent):
             hit_count += 1
-            row = [ev.rtot_s, ev.cid] + [ev.features[k] for k in ev.features.keys()]
+            # Capture parametric schema from first hit with parametrics
+            if hit_param_order is None and ev.parametrics:
+                hit_param_order = tuple(ev.parametrics.keys())
+            # Build row: features + parametrics (aligned to first-seen schema)
+            feat_vals = [ev.features[k] for k in ev.features.keys()]
+            param_vals = [ev.parametrics.get(pid, None) for pid in (hit_param_order or ())]
+            row = [ev.rtot_s, ev.cid] + feat_vals + param_vals
             rec_rows.append(row)
 
         elif isinstance(ev, WaveformEvent):
@@ -818,6 +964,10 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
                 td_pid_order = tuple(ev.parametrics.keys())
             if td_cid_order is None:
                 td_cid_order = tuple(sorted(ev.per_channel.keys()))
+            # Capture FV field names from first channel's decoded dict
+            if td_fv_keys is None and ev.per_channel:
+                first_cid = next(iter(ev.per_channel))
+                td_fv_keys = tuple(ev.per_channel[first_cid].keys())
 
             # Align to first-seen schema; log drift but keep going.
             if td_pid_order != tuple(ev.parametrics.keys()):
@@ -836,7 +986,12 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
                 )
 
             pid_vals = [ev.parametrics.get(pid, None) for pid in (td_pid_order or ())]
-            cid_vals = [ev.per_channel.get(cid, b"") for cid in (td_cid_order or ())]
+            # Flatten per-channel decoded dicts: for each CID, extract values in td_fv_keys order
+            cid_vals = []
+            for cid in (td_cid_order or ()):
+                fv_dict = ev.per_channel.get(cid, {})
+                for key in (td_fv_keys or ()):
+                    cid_vals.append(fv_dict.get(key, None))
             td_rows.append([ev.rtot_s] + pid_vals + cid_vals)
 
         if hit_count and hit_count % 1000 == 0:
@@ -864,13 +1019,16 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
                 schema_chids = tuple(name_to_chid[n] for n in ev2.features.keys())
                 break
 
-        names = ["SSSSSSSS.mmmuuun", "CH"] + [CHID_to_str[i] for i in schema_chids]
+        # Build column names: time, channel, features, then parametrics
+        feat_names = [CHID_to_str[i] for i in schema_chids]
+        param_names = [f"PARAM_{pid}" for pid in (hit_param_order or ())]
+        names = ["SSSSSSSS.mmmuuun", "CH"] + feat_names + param_names
         rec = np.rec.fromrecords(rec_rows, names=names)
 
-        if state_test_start is None:
+        if state.test_start_time is None:
             raise ValueError("Missing test start time (msg 99); cannot compute TIMESTAMP")
 
-        ts = [(state_test_start + timedelta(seconds=t)).timestamp() for t in rec["SSSSSSSS.mmmuuun"]]
+        ts = [(state.test_start_time + timedelta(seconds=t)).timestamp() for t in rec["SSSSSSSS.mmmuuun"]]
         rec = append_fields(rec, "TIMESTAMP", ts, usemask=False, asrecarray=True)
 
     if wfm_rows:
@@ -883,13 +1041,36 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
         cid_cols = []
         if td_pid_order is not None:
             pid_cols = [f"PID_{pid}" for pid in td_pid_order]
-        if td_cid_order is not None:
-            cid_cols = [f"CID_{cid}_FV" for cid in td_cid_order]
+        # Build flattened column names: CID{n}_{feature_name} for each CID and feature
+        if td_cid_order is not None and td_fv_keys is not None:
+            for cid in td_cid_order:
+                for key in td_fv_keys:
+                    cid_cols.append(f"CID{cid}_{key}")
 
         td_names = ["SSSSSSSS.mmmuuun"] + pid_cols + cid_cols
         td = np.rec.fromrecords(td_rows, names=td_names)
 
-    return rec, wfm, td
+    # Build config dict from collected hardware state
+    _ensure_hardware_recarray(state)
+    config = {
+        "test_start_time": state.test_start_time,
+        "product_name": state.product_name,
+        "user_comment": state.user_comment,
+        "chid_list": state.chid_list,
+        "demand_chid_list": state.demand_chid_list,
+        "demand_pid_list": state.demand_pid_list,
+        "gain": dict(state.gain) if state.gain else {},
+        "threshold": dict(state.threshold) if state.threshold else {},
+        "hdt": dict(state.hdt) if state.hdt else {},
+        "hlt": dict(state.hlt) if state.hlt else {},
+        "pdt": dict(state.pdt) if state.pdt else {},
+        "sampling_interval_ms": state.sampling_interval_ms,
+        "demand_rate_ms": state.demand_rate_ms,
+        "partial_power_segments": state.partial_power_segments,
+        "waveform_hardware": state.hardware,
+    }
+
+    return rec, wfm, td, config
 
 
 def get_waveform_data(wfm_row):

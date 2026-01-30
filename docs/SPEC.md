@@ -436,9 +436,9 @@ SCSH Single Channel, Single Hit
 |-------|-------|-------|
 | LEN | b1, b2 | 2 bytes |
 | ID | b1= 22 (16H) | Set threshold value (dB) ID |
-| ID |  |  |
 | CID | b1 | Which channel |
 | V | b1 | byte value for threshold<br>(MSBit = 1 float, = 0 fix) |
+| FLAGS | b1 | Unknown flags/mode (observed: 0x06) |
 
 ### **ID 23 — Set Gain**
 
@@ -448,6 +448,7 @@ SCSH Single Channel, Single Hit
 | ID | b1= 23 (17H) | Set gain value (dB) ID |
 | CID | b1 | Which channel |
 | V | b1 | 1 byte value for gain |
+| FLAGS | b1 | Unknown flags/mode (observed: 0x14 = 20) |
 
 ### **ID 24 — Set Hit Definition Time**
 
