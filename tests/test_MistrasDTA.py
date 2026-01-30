@@ -3,7 +3,7 @@ import MistrasDTA
 
 
 def test_MistrasDTA(dta_file, ref_file):
-    rec, wfm, td, config = MistrasDTA.read_bin(dta_file)
+    rec, wfm, td = MistrasDTA.read_bin(dta_file, include_td=True)
     ref = np.load(ref_file)
 
     # Do not compare TIMESTAMP, it's affected by timezone

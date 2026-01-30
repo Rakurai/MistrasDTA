@@ -895,13 +895,13 @@ def iter_bin(files: PathOrPaths, skip_wfm: bool = False, *, validate: bool = Tru
                     _ = p.read_bytes(rem)  # unknown: not decoded
 
 
-def read_bin(files: PathOrPaths, skip_wfm: bool = False):
+def read_bin(files: PathOrPaths, skip_wfm: bool = False, include_td: bool = False, include_config: bool = False):
     """
     Read AE hit summary, (optionally) waveform data, and time-driven (demand) data
     from one or more Mistras .DTA files.
 
     Returns:
-        rec, wfm, td, config
+        rec, wfm[, td][, config]  (td/config included when respective flags are True)
         
     Where config is a dict containing hardware setup information:
         - test_start_time: datetime of test start
@@ -1070,7 +1070,12 @@ def read_bin(files: PathOrPaths, skip_wfm: bool = False):
         "waveform_hardware": state.hardware,
     }
 
-    return rec, wfm, td, config
+    result = (rec, wfm)
+    if include_td:
+        result += (td,)
+    if include_config:
+        result += (config,)
+    return result
 
 
 def get_waveform_data(wfm_row):
