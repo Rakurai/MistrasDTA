@@ -1,5 +1,6 @@
 import os.path as osp
 import glob
+import pytest
 
 
 def pytest_addoption(parser):
@@ -17,15 +18,45 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.fixture
+def dta_dir(request):
+    """Configurable root directory for .DTA test data."""
+    return request.config.getoption('--dtaDir')
+
+
+@pytest.fixture
+def ref_dir(request):
+    """Configurable root directory for reference solutions."""
+    return request.config.getoption('--refDir')
+
+
+@pytest.fixture
+def dta_file(dta_dir, dta_stem):
+    """Full path to the .DTA file under test."""
+    return osp.join(dta_dir, f"{dta_stem}.DTA")
+
+
+@pytest.fixture
+def ref_file(ref_dir, dta_stem):
+    """Full path to the reference .npz file for the current stem."""
+    return osp.join(ref_dir, f"{dta_stem}.npz")
+
+
+@pytest.fixture
+def cont_files(dta_dir):
+    """Sorted list of continuation files (filenames containing '__')."""
+    return sorted(glob.glob(osp.join(dta_dir, '*__*.DTA')))
+
+
 def pytest_generate_tests(metafunc):
+    """Parametrize tests that request ``dta_stem`` over every standalone
+    .DTA file discovered in ``--dtaDir`` (continuation files excluded)."""
+    if "dta_stem" not in metafunc.fixturenames:
+        return
     dta_dir = metafunc.config.getoption('--dtaDir')
-    ref_dir = metafunc.config.getoption('--refDir')
-
-    # Generate list of files to compare
-    dta_files = glob.glob(dta_dir + '/**/*.DTA', recursive=True)
-    ref_files = [
-        osp.join(ref_dir, f"{osp.splitext(osp.basename(f))[0]}.npz")
-        for f in dta_files
-    ]
-
-    metafunc.parametrize("dta_file, ref_file", list(zip(dta_files, ref_files)))
+    stems = sorted(
+        osp.splitext(osp.basename(f))[0]
+        for f in glob.glob(osp.join(dta_dir, '*.DTA'))
+        if '__' not in osp.basename(f)
+    )
+    metafunc.parametrize("dta_stem", stems)

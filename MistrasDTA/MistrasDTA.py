@@ -97,12 +97,13 @@ def _decode_td_fv(fv_bytes, demand_chid_list, partial_power_segments):
     return values
 
 
-def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
+def read_bin(files, skip_wfm=False, include_td=False, include_config=False):
     """Function to read binary AEWin data files. The file structure schema is
     described in Appendix II of the Mistras User's Manual.
 
     Args:
-        file (str): name of a .DTA file to read
+        files (str or list): path to a .DTA file, or list of paths for
+            continuation files (state is shared across files)
         skip_wfm (bool): do not return waveforms if True
         include_td (bool): if True, return a td recarray of time-driven data
         include_config (bool): if True, return a config dict as last element
@@ -119,8 +120,8 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
     # Array to hold waveforms
     wfm = []
 
-    # Array to hold AE hardware settings
-    hardware = []
+    # Per-channel waveform hardware settings: CID -> {SRATE, TDLY}
+    hardware_cfg = {}
 
     # Dictionary to hold gain settings
     gain = {}
@@ -154,7 +155,12 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
     td_cid_order = None     # CID column order (from first TD record)
     td_fv_keys = None       # feature names per channel (from first TD record)
 
-    with open(file, "rb") as data:
+    # Normalise to a list of paths
+    if isinstance(files, str):
+        files = [files]
+
+    for file in files:
+      with open(file, "rb") as data:
         byte = data.read(2)
         while byte != b"":
 
@@ -456,7 +462,8 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
                             data.read(2)
                             LSUB = LSUB-2
 
-                            hardware.append([CHID, 1000*SRATE, TDLY])
+                            hardware_cfg[CHID] = {
+                                'SRATE': 1000*SRATE, 'TDLY': TDLY}
 
                     elif SUBID == 109:
                         # Partial Power Setup (embedded in MID 42)
@@ -471,10 +478,6 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
                             "\tSUBID {0} not yet implemented!".format(SUBID))
 
                     data.read(LSUB)
-
-                # Convert hardware settings to record array
-                hardware = np.rec.fromrecords(
-                    hardware, names=['CH', 'SRATE', 'TDLY'])
 
             elif b1 == 99:
                 logging.info("Time and Date of Test Start:")
@@ -535,9 +538,9 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
 
                 # Append waveform to wfm with data stored as a byte string
                 if not skip_wfm:
-                    channel = hardware[hardware['CH'] == CID]
-                    re = [TOT, CID, channel['SRATE'][0], channel['TDLY']
-                          [0], (AmpScaleFactor*np.array(s)).tobytes()]
+                    hw = hardware_cfg[CID]
+                    re = [TOT, CID, hw['SRATE'], hw['TDLY'],
+                          (AmpScaleFactor*np.array(s)).tobytes()]
                     wfm.append(re)
 
             else:
@@ -545,6 +548,15 @@ def read_bin(file, skip_wfm=False, include_td=False, include_config=False):
                 data.read(LEN)
 
             byte = data.read(2)
+
+    # Convert hardware_cfg dict to recarray for export
+    if hardware_cfg:
+        hardware = np.rec.fromrecords(
+            [[ch, v['SRATE'], v['TDLY']] for ch, v in
+             sorted(hardware_cfg.items())],
+            names=['CH', 'SRATE', 'TDLY'])
+    else:
+        hardware = []
 
     # Convert numpy array and add record names
     # fromrecords() fails on an empty list

@@ -55,3 +55,16 @@ def test_include_td(dta_file, ref_file):
     else:
         # File has no time-driven data — td is an empty list
         assert td == []
+
+
+def test_multi_file(cont_files):
+    """read_bin() accepts a list of continuation files."""
+    assert len(cont_files) >= 2, "need at least 2 continuation files"
+
+    rec, wfm, td = MistrasDTA.read_bin(cont_files, include_td=True)
+
+    # Should produce combined results from all files
+    assert hasattr(td, 'dtype')
+    assert len(td) > 0
+    assert hasattr(wfm, 'dtype')
+    assert len(wfm) > 0
