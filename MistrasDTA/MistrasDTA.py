@@ -75,6 +75,9 @@ def read_bin(file, skip_wfm=False):
     # Default list of characteristics
     CHID_list = []
 
+    # Parametric PID order (captured from first hit that has parametrics)
+    param_pids = None
+
     with open(file, "rb") as data:
         byte = data.read(2)
         while byte != b"":
@@ -133,8 +136,21 @@ def read_bin(file, skip_wfm=False):
                     LEN = LEN-b
                     record.append(v)
 
-                # Parmetric channels
-                data.read(LEN)
+                # Parametric channels: PID(u8) + VALUE(u16) repeats
+                # Trailing 2 bytes are undocumented (observed: varies)
+                parametrics = {}
+                while LEN >= 5:  # PID(1) + VALUE(2) + trailing(2)
+                    [pid] = struct.unpack('B', data.read(1))
+                    [val] = struct.unpack('H', data.read(2))
+                    LEN = LEN - 3
+                    parametrics[pid] = val
+                data.read(LEN)  # trailing bytes
+
+                if parametrics and param_pids is None:
+                    param_pids = tuple(parametrics.keys())
+
+                for pid in (param_pids or ()):
+                    record.append(parametrics.get(pid))
 
                 rec.append(record)
 
@@ -320,10 +336,12 @@ def read_bin(file, skip_wfm=False):
     # Convert numpy array and add record names
     # fromrecords() fails on an empty list
     if rec:
+        param_names = ['PARAM_%d' % p for p in (param_pids or ())]
         rec = np.rec.fromrecords(
             rec,
             names=['SSSSSSSS.mmmuuun', 'CH']
-            + [CHID_to_str[i] for i in CHID_list])
+            + [CHID_to_str[i] for i in CHID_list]
+            + param_names)
 
         # Append a Unix timestamp field
         timestamp = [
