@@ -20,8 +20,10 @@ CHID_to_str = {
     19: 'I-FRQ',
     20: 'SIG STRENGTH',
     21: 'ABS-ENERGY',
+    22: 'PARTIAL POWER',
     23: 'FRQ-C',
-    24: 'P-FRQ'}
+    24: 'P-FRQ',
+    31: 'UNKNOWN'}
 
 CHID_byte_len = {
     1: 2,
@@ -38,8 +40,10 @@ CHID_byte_len = {
     19: 2,
     20: 4,
     21: 4,
+    22: 0,  # variable-length: partial_power_segments bytes (from MID 109)
     23: 2,
-    24: 2}
+    24: 2,
+    31: 2}
 
 
 def _bytes_to_RTOT(bytes):
@@ -78,6 +82,9 @@ def read_bin(file, skip_wfm=False):
     # Parametric PID order (captured from first hit that has parametrics)
     param_pids = None
 
+    # Number of partial power segments (set by MID 109 or SubID 109)
+    partial_power_segments = 0
+
     with open(file, "rb") as data:
         byte = data.read(2)
         while byte != b"":
@@ -108,6 +115,12 @@ def read_bin(file, skip_wfm=False):
                 # Look up byte length and read data values
                 for CHID in CHID_list:
                     b = CHID_byte_len[CHID]
+
+                    if CHID_to_str[CHID] == 'PARTIAL POWER':
+                        v = data.read(partial_power_segments)
+                        LEN = LEN - partial_power_segments
+                        record.append(v)
+                        continue
 
                     if CHID_to_str[CHID] == 'RMS':
                         [v] = struct.unpack('H', data.read(b))
@@ -157,7 +170,7 @@ def read_bin(file, skip_wfm=False):
             elif b1 == 7:
                 logging.info("User Comments/Test Label:")
                 [m] = struct.unpack(str(LEN)+'s', data.read(LEN))
-                logging.info(m.decode("ascii").strip('\x00'))
+                logging.info(m.decode("ascii", errors="replace").strip('\x00'))
 
             elif b1 == 8:
                 logging.info("Message for Continued File")
@@ -266,6 +279,14 @@ def read_bin(file, skip_wfm=False):
 
                             hardware.append([CHID, 1000*SRATE, TDLY])
 
+                    elif SUBID == 109:
+                        # Partial Power Setup (embedded in MID 42)
+                        data.read(1)  # SEGMENT_TYPE
+                        LSUB = LSUB - 1
+                        [n_seg] = struct.unpack('H', data.read(2))
+                        LSUB = LSUB - 2
+                        partial_power_segments = n_seg
+
                     else:
                         logging.debug(
                             "\tSUBID {0} not yet implemented!".format(SUBID))
@@ -284,18 +305,31 @@ def read_bin(file, skip_wfm=False):
                 test_start_time = datetime.strptime(
                     m, '%a %b %d %H:%M:%S %Y\n')
 
+            elif b1 == 109:
+                # Partial Power Setup: SEGMENT_TYPE(u8) + N_SEG(u16) + rest
+                data.read(1)  # SEGMENT_TYPE
+                [n_seg] = struct.unpack('H', data.read(2))
+                partial_power_segments = n_seg
+                data.read(LEN - 3)
+
             elif b1 == 128:
                 RTOT = _bytes_to_RTOT(data.read(6))
+                LEN = LEN - 6
                 logging.info(
                     "{0:.7f} Resume Test or Start Of Test".format(RTOT))
+                data.read(LEN)  # trailing status byte(s)
 
             elif b1 == 129:
                 RTOT = _bytes_to_RTOT(data.read(6))
+                LEN = LEN - 6
                 logging.info("{0:.7f} Stop the test".format(RTOT))
+                data.read(LEN)
 
             elif b1 == 130:
                 RTOT = _bytes_to_RTOT(data.read(6))
+                LEN = LEN - 6
                 logging.info("{0:.7f} Pause the test".format(RTOT))
+                data.read(LEN)
 
             elif b1 == 173:
                 logging.info("Digital AE Waveform Data")
