@@ -68,3 +68,22 @@ def test_multi_file(cont_files):
     assert len(td) > 0
     assert hasattr(wfm, 'dtype')
     assert len(wfm) > 0
+
+
+def test_iter_bin(dta_file, ref_file):
+    """iter_bin() yields (type, data) tuples consistent with read_bin()."""
+    ref = np.load(ref_file, allow_pickle=True)
+    rec_ref = ref["rec"]
+
+    events = list(MistrasDTA.iter_bin(dta_file))
+    types = {t for t, _ in events}
+
+    # Must contain at least hits or other data events
+    assert len(events) > 0
+
+    hits = [d for t, d in events if t is MistrasDTA.EventType.HIT]
+    assert len(hits) == len(rec_ref)
+
+    # Verify first hit's channel matches reference
+    if hits and hasattr(rec_ref, 'dtype'):
+        assert hits[0][1] == rec_ref["CH"][0]  # cid is second element
